@@ -9,6 +9,58 @@ import numpy as np
 from .ReadNeXus import McStasNeXus
 
 
+class Variable:
+    """
+    Additional event variable to load and export as a scipp coordinate
+
+    :param coord_name: Name of the scipp coordinate to create
+    :param variable_name: Name of the variable in the McStas event data,
+                          see ``Data.get_component_variables``
+    :param unit: Unit of the variable as a scipp unit string, e.g. ``"s"``
+    """
+
+    def __init__(self, coord_name: str, variable_name: str, unit: str):
+        for name, value in (
+            ("coord_name", coord_name),
+            ("variable_name", variable_name),
+            ("unit", unit),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"Variable {name} must be a string.")
+            if not value:
+                raise ValueError(f"Variable {name} must not be empty.")
+        self.coord_name = coord_name
+        self.variable_name = variable_name
+        self.unit = unit
+
+    def __repr__(self) -> str:
+        return (
+            f"Variable(coord_name={self.coord_name!r}, "
+            f"variable_name={self.variable_name!r}, unit={self.unit!r})"
+        )
+
+
+def _prepare_extra_variables(extra_variables) -> list[Variable]:
+    """
+    Normalizes extra_variables to a list of Variable instances
+
+    :param extra_variables: None, a single Variable or a list of Variables
+    :return: list of Variables, empty if None was given
+    """
+    if extra_variables is None:
+        return []
+    if isinstance(extra_variables, Variable):
+        return [extra_variables]
+    if not isinstance(extra_variables, list) or any(
+        not isinstance(variable, Variable) for variable in extra_variables
+    ):
+        raise TypeError(
+            "extra_variables must be a Variable or a list of Variables, "
+            f"got {type(extra_variables).__name__}."
+        )
+    return extra_variables
+
+
 class Data:
     """
     Interface class, with context handler, loads data using McStasNeXus data class
@@ -440,8 +492,9 @@ class Data:
         :param component_name: Name of component with data
                                (if None all is loaded, can also be list)
         :param filter_zeros: If True events with zero weight are filtered out
-        :param extra_variables: List of extra variables to load and include
-                                (not yet functional)
+        :param extra_variables: A Variable or list of Variables with
+                                additional event data to include as
+                                scipp coordinates
         :return: scipp object
         """
         try:
@@ -451,14 +504,10 @@ class Data:
                 "Scipp installation required to export to Scipp format"
             ) from e
 
+        # Default is to gather weight, time and id
         variables = ["p", "t", "id"]
-
-        # Starting to implement adding additional variables, but not yet done.
-        if extra_variables is not None:
-            if not isinstance(extra_variables, list):
-                extra_variables = [extra_variables]
-            # Default is to gather weight, time and id
-            variables += extra_variables
+        extra_variables = _prepare_extra_variables(extra_variables)
+        variables += [variable.variable_name for variable in extra_variables]
 
         event_data = self.get_event_data(
             variables=variables,
@@ -486,6 +535,12 @@ class Data:
                 'sample_position': sc.vector(sample_pos, unit='m'),
             },
         )
+        for variable in extra_variables:
+            events.coords[variable.coord_name] = sc.array(
+                dims=['events'],
+                unit=variable.unit,
+                values=event_data[variable.variable_name],
+            )
 
         return events
 
@@ -505,8 +560,9 @@ class Data:
         :param component_name: Name of component with data
                                (if None all is loaded, can also be list)
         :param filter_zeros: If True events with zero weight are filtered out
-        :param extra_variables: List of extra variables to load and include
-                                (not yet functional)
+        :param extra_variables: A Variable or list of Variables with
+                                additional event data to include as
+                                scipp coordinates
         :return: scipp DataGroup with events, positions, bank_ids and bank_names
         """
         try:
@@ -518,12 +574,10 @@ class Data:
 
         # todo: Make as generator to work in chunks
 
+        # Default is to gather weight, time and id
         variables = ["p", "t", "id"]
-        if extra_variables is not None:
-            if not isinstance(extra_variables, list):
-                extra_variables = [extra_variables]
-            # Default is to gather weight, time and id
-            variables += extra_variables
+        extra_variables = _prepare_extra_variables(extra_variables)
+        variables += [variable.variable_name for variable in extra_variables]
 
         event_data = self.get_event_data(
             variables=variables,
@@ -547,6 +601,12 @@ class Data:
                 'sample_position': sc.vector(sample_pos, unit='m'),
             },
         )
+        for variable in extra_variables:
+            events.coords[variable.coord_name] = sc.array(
+                dims=['events'],
+                unit=variable.unit,
+                values=event_data[variable.variable_name],
+            )
 
         # Retrieve coordinates corresponding to id's
         global_coordinates = self.get_id_to_global_coordinates(
