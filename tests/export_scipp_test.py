@@ -12,6 +12,7 @@ import scipp as sc
 
 import mcstastox
 from mcstastox.LoadFile import Data, Variable
+from mcstastox.Sampling import SamplingSettings
 
 N_EVENTS = 3
 
@@ -43,6 +44,30 @@ def _make_data():
     return data, state
 
 
+def _make_chunked_data():
+    data, state = _make_data()
+    event_data = {
+        "p": np.array([1.0, 2.0, 3.0]),
+        "t": np.array([10.0, 20.0, 30.0]),
+        "id": np.array([0, 1, 2]),
+        "L": np.array([1.5, 1.7, 1.9]),
+        "x": np.array([-0.5, 0.0, 0.5]),
+    }
+
+    def iter_event_chunks(variables, component_name, chunk_size, filter_zeros):
+        state["requested_variables"] = list(variables)
+        state["chunk_size"] = chunk_size
+        for start in range(0, len(event_data["p"]), 2):
+            yield {
+                variable: values[start : start + 2]
+                for variable, values in event_data.items()
+                if variable in variables
+            }
+
+    data._iter_event_chunks = iter_event_chunks
+    return data, state
+
+
 def _flatten_binned(array):
     """Flatten a binned scipp variable to a single numpy array."""
     return np.concatenate([np.asarray(value.values) for value in array.values])
@@ -66,7 +91,7 @@ def test_show_components_with_geometry_prints_once(capsys):
     data.show_components_with_geometry()
 
     assert capsys.readouterr().out == (
-        "All components with geometry information in file:\n" "Square_1\n" "Banana_1\n"
+        "All components with geometry information in file:\nSquare_1\nBanana_1\n"
     )
 
 
@@ -142,6 +167,41 @@ def test_export_scipp_simple_single_variable():
     assert state["requested_variables"] == ["p", "t", "id", "L"]
     np.testing.assert_array_equal(
         events.coords["sim_wavelength"].values, [1.5, 1.7, 1.9]
+    )
+
+
+def test_export_scipp_simple_sampling_returns_unit_weight_events():
+    data, state = _make_chunked_data()
+    events = data.export_scipp_simple(
+        source_name="source",
+        sample_name="sample_position",
+        extra_variables=Variable("sim_wavelength", "L", "angstrom"),
+        sampling=SamplingSettings(n_samples=20, seed=42),
+        chunk_size=2,
+    )
+
+    assert state["requested_variables"] == ["p", "t", "id", "L"]
+    assert events.sizes["events"] == 20
+    np.testing.assert_array_equal(events.values, np.ones(20))
+    assert set(events.coords["t"].values).issubset({10.0, 20.0, 30.0})
+    assert set(events.coords["sim_wavelength"].values).issubset({1.5, 1.7, 1.9})
+
+
+def test_export_scipp_sampling_is_reproducible():
+    first, _ = _make_chunked_data()
+    second, _ = _make_chunked_data()
+    settings = SamplingSettings(n_samples=20, seed=7)
+
+    first_events = first.export_scipp_simple(
+        "source", "sample_position", sampling=settings, chunk_size=2
+    )
+    second_events = second.export_scipp_simple(
+        "source", "sample_position", sampling=settings, chunk_size=2
+    )
+
+    np.testing.assert_array_equal(first_events.values, second_events.values)
+    np.testing.assert_array_equal(
+        first_events.coords["t"].values, second_events.coords["t"].values
     )
 
 

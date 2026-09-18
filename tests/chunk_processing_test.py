@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from mcstastox import SamplingSettings
 from mcstastox.LoadFile import Data, Variable
 
 FIXTURE = Path(__file__).parents[1] / "docs" / "user-guide" / "test_12"
@@ -124,6 +125,33 @@ def test_simple_export_chunking_handles_empty_result():
     )
 
     assert events.sizes["events"] == 0
+
+
+def test_simple_export_sampling_reads_in_chunks():
+    with Data(FIXTURE) as data:
+        events = data.export_scipp_simple(
+            "source",
+            "sample_position",
+            component_name="Square_1",
+            chunk_size=7,
+            sampling=SamplingSettings(n_samples=25, seed=42),
+        )
+
+    assert events.sizes["events"] == 25
+    np.testing.assert_array_equal(events.values, np.ones(25))
+
+
+def test_grouped_export_sampling_returns_unit_weight_events():
+    with Data(FIXTURE) as data:
+        output = data.export_scipp(
+            "source",
+            "sample_position",
+            component_name="Square_1",
+            chunk_size=7,
+            sampling=SamplingSettings(n_samples=25, seed=42),
+        )
+
+    np.testing.assert_array_equal(_flatten_binned(output["events"].data), np.ones(25))
 
 
 @pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True, "4"])

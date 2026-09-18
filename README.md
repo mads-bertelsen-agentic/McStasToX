@@ -65,3 +65,23 @@ with mcstastox.Read(file_path) as loaded_data:
 ```
 
 This takes less space and events are already grouped by pixel ids
+
+Weighted McStas events can be converted to normal unit-weight events while
+exporting by passing sampling settings. Sampling is performed as a stream, so
+only the requested number of events is kept in memory:
+
+```
+import mcstastox
+
+settings = mcstastox.SamplingSettings(n_samples=100_000, seed=42)
+with mcstastox.Read(file_path) as loaded_data:
+    sampled = loaded_data.export_scipp(
+        source_name="source",
+        sample_name="sample_position",
+        sampling=settings,
+    )
+```
+
+Sampling is weighted by the original event probabilities, allows repeated
+events, and sets every sampled event weight to one. Set `ordered=True` to keep
+the order of the input event stream.
