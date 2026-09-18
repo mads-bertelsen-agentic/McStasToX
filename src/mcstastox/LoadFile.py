@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025 Mccode-dev contributors (https://github.com/mccode-dev)
-import logging
 import os
+import sys
 
 import h5py
 import numpy as np
@@ -81,9 +81,6 @@ class Data:
         self.pixel_range = {}  # list of len 2, lowest and highest pixel ID
         self.local_pixel_locations = {}  # list of length
         self.global_pixel_locations = {}
-        self.logger = logging.getLogger(__name__)
-        self.logger.addHandler(logging.StreamHandler())
-        self.logger.setLevel(logging.INFO)
 
     def close(self):
         # Close the file when done
@@ -125,10 +122,10 @@ class Data:
         """
         Show all components
         """
-        self.logger.info("All components in file:")
+        sys.stdout.write("All components in file:\n")
         comps = self.get_components()
         for comp in comps:
-            self.logger.info("%s", comp)
+            sys.stdout.write(f"{comp}\n")
 
     def show_components_with_data(self):
         """
@@ -136,11 +133,11 @@ class Data:
         """
         comps = self.get_components_with_data()
         if len(comps) == 0:
-            self.logger.info("No components with data in file:")
+            sys.stdout.write("No components with data in file:\n")
         else:
-            self.logger.info("All components with data in file:")
+            sys.stdout.write("All components with data in file:\n")
             for comp in comps:
-                self.logger.info("%s", comp)
+                sys.stdout.write(f"{comp}\n")
 
     def show_components_with_ids(self):
         """
@@ -148,11 +145,11 @@ class Data:
         """
         comps = self.get_components_with_ids()
         if len(comps) == 0:
-            self.logger.info("No components with pixel id information in file:")
+            sys.stdout.write("No components with pixel id information in file:\n")
         else:
-            self.logger.info("All components with pixel id information in file:")
+            sys.stdout.write("All components with pixel id information in file:\n")
             for comp in comps:
-                self.logger.info("%s", comp)
+                sys.stdout.write(f"{comp}\n")
 
     def show_components_with_geometry(self):
         """
@@ -160,11 +157,11 @@ class Data:
         """
         comps = self.get_components_with_geometry()
         if len(comps) == 0:
-            self.logger.info("No components with geometry information in file:")
+            sys.stdout.write("No components with geometry information in file:\n")
         else:
-            self.logger.info("All components with geometry information in file:")
+            sys.stdout.write("All components with geometry information in file:\n")
             for comp in comps:
-                self.logger.info("%s", comp)
+                sys.stdout.write(f"{comp}\n")
 
     def get_component_variables(self, component_name):
         """

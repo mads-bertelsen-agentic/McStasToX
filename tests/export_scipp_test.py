@@ -59,6 +59,17 @@ def test_variable_exported_from_package_top_level():
     assert mcstastox.Variable is Variable
 
 
+def test_show_components_with_geometry_prints_once(capsys):
+    data = Data.__new__(Data)
+    data.get_components_with_geometry = lambda: ["Square_1", "Banana_1"]
+
+    data.show_components_with_geometry()
+
+    assert capsys.readouterr().out == (
+        "All components with geometry information in file:\n" "Square_1\n" "Banana_1\n"
+    )
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
