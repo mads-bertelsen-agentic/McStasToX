@@ -13,4 +13,4 @@ del importlib
 
 from .LoadFile import Data as Read
 from .LoadFile import Variable
-from .Sampling import SamplingSettings, sample_event_chunks
+from .Sampling import SampledEventData, SamplingSettings, sample_event_chunks

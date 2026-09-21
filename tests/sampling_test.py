@@ -22,6 +22,8 @@ def test_sampling_is_weighted_and_returns_unit_weights():
     assert result["p"].shape == (1000,)
     np.testing.assert_array_equal(result["p"], np.ones(1000))
     assert 0.65 < np.mean(result["id"] == 20) < 0.85
+    assert result.total_weight == 4.0
+    assert result.effective_duration == 250.0
 
 
 def test_sampling_handles_chunks_and_ordering():
@@ -45,6 +47,7 @@ def test_sampling_with_no_positive_weights_is_empty():
 
     assert result["p"].size == 0
     assert result["id"].size == 0
+    assert result.effective_duration is None
 
 
 @pytest.mark.parametrize("kwargs", [{"n_samples": 0}, {"n_samples": -1}])

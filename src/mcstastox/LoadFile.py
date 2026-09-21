@@ -571,7 +571,7 @@ class Data:
 
         if sampling is not None:
             sampling_chunk_size = chunk_size or _DEFAULT_SAMPLING_CHUNK_SIZE
-            event_data = sample_event_chunks(
+            sampled_event_data = sample_event_chunks(
                 self._iter_event_chunks(
                     variables,
                     component_name,
@@ -580,9 +580,10 @@ class Data:
                 ),
                 sampling,
             )
+            event_data = sampled_event_data
             if not event_data:
                 event_data = {variable: np.empty(0) for variable in variables}
-            return self._event_data_to_scipp(
+            events = self._event_data_to_scipp(
                 sc,
                 event_data,
                 global_coordinates,
@@ -591,6 +592,11 @@ class Data:
                 extra_variables,
                 simple,
             )
+            if sampled_event_data.effective_duration is not None:
+                events.coords["effective_duration"] = sc.scalar(
+                    sampled_event_data.effective_duration, unit="s"
+                )
+            return events
 
         if chunk_size is None:
             event_data = self.get_event_data(

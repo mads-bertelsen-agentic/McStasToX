@@ -73,6 +73,26 @@ class SamplingSettings:
             raise TypeError("ordered must be a bool")
 
 
+class SampledEventData(dict[str, np.ndarray]):
+    """Sampled event arrays and the total weight of the input stream."""
+
+    def __init__(self, event_data: dict[str, np.ndarray], total_weight: float):
+        super().__init__(event_data)
+        self.total_weight = total_weight
+
+    @property
+    def effective_duration(self) -> float | None:
+        """Return the duration represented by the unit-weight sample in seconds.
+
+        This is defined when the input weights represent a count rate. It is
+        ``number of sampled events / total input weight``.
+        """
+        n_events = len(self.get("p", ()))
+        if n_events == 0 or self.total_weight <= 0:
+            return None
+        return n_events / self.total_weight
+
+
 class _WeightedEventSampler:
     """Weighted reservoir sampler for dictionaries of event arrays."""
 
@@ -157,24 +177,27 @@ class _WeightedEventSampler:
 
         self._seen_events += len(weights)
 
-    def result(self) -> dict[str, np.ndarray]:
+    def result(self) -> SampledEventData:
         """Return sampled event arrays with unit weights."""
         if self._reservoir is None or self._keys is None:
-            return {}
+            return SampledEventData({}, self._total_weight)
 
         result = {key: values.copy() for key, values in self._reservoir.items()}
         if not self._has_samples:
-            return {key: values[:0] for key, values in result.items()}
+            return SampledEventData(
+                {key: values[:0] for key, values in result.items()},
+                self._total_weight,
+            )
         if self._positions is not None:
             order = np.argsort(self._positions, kind="stable")
             result = {key: values[order] for key, values in result.items()}
         result["p"] = np.ones(self._n_samples, dtype=np.float64)
-        return result
+        return SampledEventData(result, self._total_weight)
 
 
 def sample_event_chunks(
     event_chunks: Iterable[dict[str, np.ndarray]], settings: SamplingSettings
-) -> dict[str, np.ndarray]:
+) -> SampledEventData:
     """Sample weighted event dictionaries without collecting the input stream.
 
     The input dictionaries must contain a one-dimensional ``p`` array and all
@@ -183,7 +206,7 @@ def sample_event_chunks(
 
     :param event_chunks: Iterable of event dictionaries
     :param settings: Sampling configuration
-    :return: sampled event data with unit ``p`` values
+    :return: sampled event data with unit ``p`` values and input weight metadata
     """
     if not isinstance(settings, SamplingSettings):
         raise TypeError("settings must be a SamplingSettings instance")

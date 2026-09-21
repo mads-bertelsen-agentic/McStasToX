@@ -185,6 +185,8 @@ def test_export_scipp_simple_sampling_returns_unit_weight_events():
     np.testing.assert_array_equal(events.values, np.ones(20))
     assert set(events.coords["t"].values).issubset({10.0, 20.0, 30.0})
     assert set(events.coords["sim_wavelength"].values).issubset({1.5, 1.7, 1.9})
+    assert events.coords["effective_duration"].unit == sc.units.s
+    assert events.coords["effective_duration"].value == pytest.approx(20 / 6)
 
 
 def test_export_scipp_sampling_is_reproducible():
@@ -203,6 +205,20 @@ def test_export_scipp_sampling_is_reproducible():
     np.testing.assert_array_equal(
         first_events.coords["t"].values, second_events.coords["t"].values
     )
+
+
+def test_export_scipp_sampling_preserves_effective_duration():
+    data, _ = _make_chunked_data()
+    output = data.export_scipp(
+        "source",
+        "sample_position",
+        sampling=SamplingSettings(n_samples=20, seed=42),
+        chunk_size=2,
+    )
+
+    duration = output["events"].coords["effective_duration"]
+    assert duration.unit == sc.units.s
+    assert duration.value == pytest.approx(20 / 6)
 
 
 def test_export_scipp_keeps_standard_behavior():

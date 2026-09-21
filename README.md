@@ -84,4 +84,6 @@ with mcstastox.Read(file_path) as loaded_data:
 
 Sampling is weighted by the original event probabilities, allows repeated
 events, and sets every sampled event weight to one. Set `ordered=True` to keep
-the order of the input event stream.
+the order of the input event stream. The sampled scipp object also contains a
+scalar `effective_duration` coordinate. When the input weights are detector
+count rates, this is `n_samples / sum(p)` in seconds.
