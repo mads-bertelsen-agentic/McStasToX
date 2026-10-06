@@ -65,3 +65,12 @@ with mcstastox.Read(file_path) as loaded_data:
 ```
 
 This takes less space and events are already grouped by pixel ids
+
+For scanned simulations with multiple entries in the HDF5 file, the first
+entry is loaded by default. Select another entry using its one-based number:
+
+```
+with mcstastox.Read(file_path, entry_number=2) as loaded_data:
+    print(loaded_data.get_number_of_entries())
+    print(loaded_data.get_instrument_parameters())
+```
