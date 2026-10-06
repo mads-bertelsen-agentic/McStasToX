@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2025 Mccode-dev contributors (https://github.com/mccode-dev)
-import logging
+# ruff: noqa: T201
 import os
 
 import h5py
@@ -9,10 +9,10 @@ import numpy as np
 from .ReadNeXus import McStasNeXus
 
 
-class Variable:
-    def __init__(self, coord_name, variable_name, unit):
-        self.coord_name = coord_name
-        self.variable_name = variable_name
+class Transfer:
+    def __init__(self, mcstas_variable, scipp_coord, unit=None):
+        self.mcstas_variable = mcstas_variable
+        self.scipp_coord = scipp_coord
         self.unit = unit
 
 
@@ -36,9 +36,6 @@ class Data:
         self.pixel_range = {}  # list of len 2, lowest and highest pixel ID
         self.local_pixel_locations = {}  # list of length
         self.global_pixel_locations = {}
-        self.logger = logging.getLogger(__name__)
-        self.logger.addHandler(logging.StreamHandler())
-        self.logger.setLevel(logging.INFO)
 
     def close(self):
         # Close the file when done
@@ -80,10 +77,10 @@ class Data:
         """
         Show all components
         """
-        self.logger.info("All components in file:")
+        print("All components in file:")
         comps = self.get_components()
         for comp in comps:
-            self.logger.info("%s", comp)
+            print(comp)
 
     def show_components_with_data(self):
         """
@@ -91,11 +88,11 @@ class Data:
         """
         comps = self.get_components_with_data()
         if len(comps) == 0:
-            self.logger.info("No components with data in file:")
+            print("No components with data in file:")
         else:
-            self.logger.info("All components with data in file:")
+            print("All components with data in file:")
             for comp in comps:
-                self.logger.info("%s", comp)
+                print(comp)
 
     def show_components_with_ids(self):
         """
@@ -103,11 +100,11 @@ class Data:
         """
         comps = self.get_components_with_ids()
         if len(comps) == 0:
-            self.logger.info("No components with pixel id information in file:")
+            print("No components with pixel id information in file:")
         else:
-            self.logger.info("All components with pixel id information in file:")
+            print("All components with pixel id information in file:")
             for comp in comps:
-                self.logger.info("%s", comp)
+                print(comp)
 
     def show_components_with_geometry(self):
         """
@@ -115,11 +112,11 @@ class Data:
         """
         comps = self.get_components_with_geometry()
         if len(comps) == 0:
-            self.logger.info("No components with geometry information in file:")
+            print("No components with geometry information in file:")
         else:
-            self.logger.info("All components with geometry information in file:")
+            print("All components with geometry information in file:")
             for comp in comps:
-                self.logger.info("%s", comp)
+                print(comp)
 
     def get_component_variables(self, component_name):
         """
@@ -525,9 +522,9 @@ class Data:
 
         # todo: Make as generator to work in chunks
 
-        base_variables = ["p", "id"] # requires special care
+        base_variables = ["p", "id"]  # requires special care
         variables = [
-            Variable(coord_name="t", variable_name="t", unit="s"),
+            Transfer(mcstas_variable="t", scipp_coord="t", unit="s"),
         ]
 
         if extra_variables is not None:
@@ -537,11 +534,11 @@ class Data:
             variables += extra_variables
 
         load_variables = base_variables
-        for variable in variables:
-            if not isinstance(variable, Variable):
-                raise TypeError("Use Variable class to add extra variables.")
+        for transfer in variables:
+            if not isinstance(transfer, Transfer):
+                raise TypeError("Use Transfer class to add extra variables.")
 
-            load_variables.append(variable.variable_name)
+            load_variables.append(transfer.mcstas_variable)
 
         event_data = self.get_event_data(
             variables=load_variables,
@@ -565,10 +562,12 @@ class Data:
                 'sample_position': sc.vector(sample_pos, unit='m'),
             },
         )
-        for variable in variables:
-            events.coords[variable.coord_name] = sc.array(dims=["events"],
-                                                          unit=variable.unit,
-                                                          values=event_data[variable.variable_name])
+        for transfer in variables:
+            events.coords[transfer.scipp_coord] = sc.array(
+                dims=["events"],
+                unit=transfer.unit,
+                values=event_data[transfer.mcstas_variable],
+            )
 
         # Retrieve coordinates corresponding to id's
         global_coordinates = self.get_id_to_global_coordinates(
