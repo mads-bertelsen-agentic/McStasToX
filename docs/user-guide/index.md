@@ -10,4 +10,6 @@ overall_demo.ipynb
 scipp_demo.ipynb
 scan_demo.ipynb
 stream_sampling_demo.ipynb
+custom_nexus
+custom_nexus_demo.ipynb
 ```

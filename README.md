@@ -98,3 +98,17 @@ scalar `effective_duration` coordinate. When the input weights are detector
 count rates, this is `n_samples / sum(weight)` in seconds. The input weight
 column defaults to `p` and can be changed with `weight_key`. Its Scipp
 variance is propagated from the McStas weight variance `sum(weight**2)`.
+
+## Custom NeXus Output
+
+Describe a custom output with `create_template(reference_file)` or
+`create_empty_template()`, then write it with `write_nexus`. Templates record
+instructions without modifying their reference files. Shared event sources
+can populate separate destination arrays with ID mappings, unit conversions,
+and sampling-result metadata. Retained-data audits and summaries help inspect
+and clean experimental reference files before writing.
+
+See the [custom NeXus guide](docs/user-guide/custom_nexus.md) for complete examples,
+supported HDF5 features, and memory limits. Sampling uses the existing sampler
+and retains the requested sample in memory; output batching does not remove
+that cost. Only NumPy and h5py are required.
