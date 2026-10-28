@@ -1638,7 +1638,9 @@ class NexusTemplate:
         counters = {"sample": 0, "source": 0}
 
         def provider_label(value: Any) -> str:
-            provider = getattr(value, "source", value)
+            provider = getattr(
+                value, "execution_source", getattr(value, "source", value)
+            )
             key = id(provider)
             if key not in labels:
                 sampled = any(
@@ -1687,6 +1689,22 @@ class NexusTemplate:
         lines = [f"NexusTemplate: base={base}"]
         for label, provider in islice(labels.values(), limit):
             lines.append(f"{label}: {self._provider_description(provider)}")
+            stages = getattr(provider, "preprocessors", ())
+            if stages:
+                lines.append(
+                    "  raw read dependencies: "
+                    + _brief(provider.required_variables)
+                    + "; raw dtypes and accepted rows unknown until execution"
+                )
+                for index, stage in enumerate(islice(stages, limit), 1):
+                    lines.append(
+                        f"  preprocessing {index}: " + _brief(stage.description, 220)
+                    )
+                    lines.append("    declared output schema: " + _brief(stage.schema))
+                if len(stages) > limit:
+                    lines.append(
+                        f"  ... {len(stages) - limit} more preprocessing stages"
+                    )
         if len(labels) > limit:
             lines.append(f"... {len(labels) - limit} more shared sources")
         lines.append(
@@ -1707,6 +1725,18 @@ class NexusTemplate:
             lines.extend(
                 "  " + describe(binding) for binding in islice(plan.bindings, 3)
             )
+            for binding in islice(plan.bindings, 3):
+                stages = getattr(binding.value, "chunk_operations", ())
+                for index, stage in enumerate(islice(stages, 3), 1):
+                    lines.append(
+                        f"    chunk transform {index}: inputs={_brief(stage.inputs)}; "
+                        + _brief(stage.description, 180)
+                    )
+                    lines.append(
+                        "      declared output schema: " + _brief(stage.schema)
+                    )
+                if len(stages) > 3:
+                    lines.append(f"    ... {len(stages) - 3} more chunk transforms")
             if len(plan.bindings) > 3:
                 lines.append(f"  ... {len(plan.bindings) - 3} more bindings")
             for name, binding in islice(plan.attributes.items(), 3):

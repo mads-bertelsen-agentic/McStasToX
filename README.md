@@ -104,9 +104,11 @@ variance is propagated from the McStas weight variance `sum(weight**2)`.
 Describe a custom output with `create_template(reference_file)` or
 `create_empty_template()`, then write it with `write_nexus`. Templates record
 instructions without modifying their reference files. Shared event sources
-can populate separate destination arrays with ID mappings, unit conversions,
-and sampling-result metadata. Retained-data audits and summaries help inspect
-and clean experimental reference files before writing.
+can preprocess raw columns to derive IDs/reject rows before sampling, then
+populate aligned destination arrays or tables through row-preserving multicolumn
+transforms, ID mappings, and unit conversions. Sampling-result metadata uses
+accepted weights. Retained-data audits and summaries help inspect and clean
+experimental reference files before writing.
 
 See the [custom NeXus guide](docs/user-guide/custom_nexus.md) for complete examples,
 supported HDF5 features, and memory limits. Sampling uses the existing sampler

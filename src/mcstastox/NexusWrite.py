@@ -22,7 +22,14 @@ from typing import Any
 import h5py
 import numpy as np
 
-from .NexusSource import EventColumn, EventSource, SourceContext, _checked_cast
+from .NexusSource import (
+    ChunkOperation,
+    EventColumn,
+    EventSource,
+    EventTransform,
+    SourceContext,
+    _checked_cast,
+)
 from .NexusTemplate import (
     Binding,
     Diagnostic,
@@ -57,6 +64,7 @@ class DestinationResult:
     n_written: int
     source: EventSource | str | None = None
     transformations: tuple[str, ...] = ()
+    chunk_operations: tuple[ChunkOperation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,6 +85,9 @@ class WriteReport:
     diagnostics: tuple[Diagnostic, ...] = ()
     retained_datasets: tuple[RetainedDataset, ...] = ()
     link_repairs: tuple[tuple[str, str], ...] = ()
+    preprocessing: dict[EventSource, tuple[ChunkOperation, ...]] = field(
+        default_factory=dict
+    )
 
     def __repr__(self) -> str:
         return (
@@ -377,14 +388,17 @@ def write_nexus(
             _supported_dtype(dataset.dtype)
 
         def register(provider: Any) -> EventSource:
+            if isinstance(provider, EventTransform):
+                provider = provider.execution_source
             if not isinstance(provider, EventSource):
                 raise TypeError("Result bindings require an EventSource")
             if provider not in schemas:
                 reader, components, schema, _ = provider._inspect(context)
                 for component in components:
                     inspect_dataset(reader.get_info_entry(component)["events"])
-                schemas[provider] = schema
+                schemas[provider] = provider._processed_schema(schema)
                 consumers[provider] = []
+                report.preprocessing[provider] = provider.preprocessors
             return provider
 
         def full_binding(plan: NodePlan) -> Binding | None:
@@ -399,24 +413,30 @@ def write_nexus(
                         register(binding.value[0])
                     elif binding.kind == "copy":
                         value = binding.value
-                        if isinstance(value, (EventSource, EventColumn)):
+                        if isinstance(
+                            value, (EventSource, EventTransform, EventColumn)
+                        ):
                             if binding.selection is not None:
                                 raise ValueError(
                                     "Event projections require whole-dataset bindings"
                                 )
-                            provider = register(
+                            provider = register(value.execution_source)
+                            projection = (
                                 value.source
                                 if isinstance(value, EventColumn)
                                 else value
                             )
+                            projected_schema = projection._processed_schema(
+                                schemas[provider]
+                            )
                             if isinstance(value, EventColumn):
-                                value.output_dtype(schemas[provider][value.variable])
+                                value.output_dtype(projected_schema[value.variable])
                             else:
                                 columns = binding.options.get("columns")
                                 if not columns or len(set(columns)) != len(columns):
                                     raise ValueError("Event tables need unique columns")
                                 for column in columns:
-                                    if column not in provider.variables:
+                                    if column not in projection.output_variables:
                                         raise ValueError(
                                             f"Undeclared table column {column}"
                                         )
@@ -480,8 +500,13 @@ def write_nexus(
                 def record(plan: NodePlan, origin: Any = None) -> None:
                     obj = created[plan.object_key]
                     provider = (
-                        origin.source if isinstance(origin, EventColumn) else origin
+                        origin.execution_source
+                        if isinstance(
+                            origin, (EventSource, EventTransform, EventColumn)
+                        )
+                        else origin
                     )
+                    chunk_operations = getattr(origin, "chunk_operations", ())
                     operations = (
                         tuple(op.description for op in origin.operations)
                         if isinstance(origin, EventColumn)
@@ -492,7 +517,11 @@ def write_nexus(
                         obj.dtype,
                         obj.shape[0] if obj.shape else 1,
                         provider,
-                        operations,
+                        (
+                            *tuple(op.description for op in chunk_operations),
+                            *operations,
+                        ),
+                        chunk_operations,
                     )
                     for path in aliases[plan.object_key]:
                         report.destinations[path] = result
@@ -504,6 +533,8 @@ def write_nexus(
                         return binding.value(context)
                     if binding.kind == "result":
                         provider, selector = binding.value
+                        if isinstance(provider, EventTransform):
+                            provider = provider.execution_source
                         result = report.sources[provider]
                         value = (
                             getattr(result, selector)
@@ -637,12 +668,24 @@ def write_nexus(
                     for plan in plans:
                         binding = full_binding(plan)
                         column = binding.value
+                        projection = (
+                            column.source if isinstance(column, EventColumn) else column
+                        )
+                        projected_schema = (
+                            projection._processed_schema(schema)
+                            if isinstance(projection, EventTransform)
+                            else schema
+                        )
                         if isinstance(column, EventColumn):
-                            incoming = column.output_dtype(schema[column.variable])
+                            incoming = column.output_dtype(
+                                projected_schema[column.variable]
+                            )
                             trailing = ()
                         else:
                             names = binding.options["columns"]
-                            incoming = np.result_type(*(schema[name] for name in names))
+                            incoming = np.result_type(
+                                *(projected_schema[name] for name in names)
+                            )
                             trailing = (len(names),)
                         dtype = _output_dtype(
                             plan, incoming, explicit_keys(plan), whole=True
@@ -661,6 +704,7 @@ def write_nexus(
                             batch = {
                                 key: values[start:stop] for key, values in chunk.items()
                             }
+                            transformed = {}
                             for plan in plans:
                                 binding = full_binding(plan)
                                 obj = created[plan.object_key]
@@ -668,11 +712,26 @@ def write_nexus(
                                     if count is None:
                                         obj.resize(offset + stop - start, axis=0)
                                     if isinstance(binding.value, EventColumn):
-                                        values = binding.value.apply(batch)
+                                        values = binding.value.apply(
+                                            batch, cache=transformed
+                                        )
                                     else:
+                                        table_batch = (
+                                            binding.value.apply(
+                                                batch, cache=transformed
+                                            )
+                                            if isinstance(binding.value, EventTransform)
+                                            else batch
+                                        )
+                                        # Preserve mixed integer IDs before stacking.
                                         values = np.column_stack(
                                             [
-                                                batch[name]
+                                                _cast_value(
+                                                    table_batch[name],
+                                                    obj.dtype,
+                                                    explicit="dtype"
+                                                    in explicit_keys(plan),
+                                                )
                                                 for name in binding.options["columns"]
                                             ]
                                         )

@@ -10,6 +10,7 @@ import pytest
 
 from mcstastox.LoadFile import Data
 from mcstastox.NexusSource import (
+    ChunkOperation,
     ColumnOperation,
     EventColumn,
     EventSource,
@@ -364,6 +365,83 @@ def test_source_specs_are_normalized_immutable_and_identity_based():
         original.sample(9)
     with pytest.raises(KeyError, match="not declared"):
         sampled["w"]
+
+
+def test_preprocessing_contract_separates_raw_and_processed_schemas(
+    tmp_path, monkeypatch
+):
+    path = _write_source(
+        tmp_path / "logger.nxs",
+        components=[("Logger", _EVENTS, "p t x w L", False)],
+    )
+    schema = {"p": "float64", "id": "int64", "t": "float64"}
+    raw = event_source(component_name="Logger", variables=("x", "t"))
+    prepared = raw.preprocess(
+        _no_payload, schema=schema, description="Voxel acceptance"
+    )
+    schema["id"] = "float32"
+    sampled = prepared.sample(SamplingSettings(7, seed=42))
+    assert raw.output_variables == ("x", "t")
+    assert prepared.variables == raw.variables
+    assert sampled.output_variables == ("p", "id", "t")
+    assert sampled.required_variables == ("x", "t", "p")
+    assert sampled["id"].variable == "id"
+    with pytest.raises(KeyError, match="not declared"):
+        sampled["x"]
+    with pytest.raises(ValueError, match="before sample"):
+        sampled.preprocess(_no_payload, schema=schema)
+    with pytest.raises(TypeError):
+        sampled.preprocessors[0].schema["id"] = np.dtype("float32")
+    assert isinstance(prepared.preprocessors[0], ChunkOperation)
+    assert "Voxel acceptance" in prepared.description
+    with SourceContext(path, entry_number=2) as context:
+        monkeypatch.setattr(h5py.Dataset, "__getitem__", _no_payload)
+        assert sampled.raw_schema(context) == dict.fromkeys(
+            ("x", "t", "p"), np.dtype("float64")
+        )
+        assert sampled.schema(context) == {
+            "p": np.dtype("float64"),
+            "id": np.dtype("int64"),
+            "t": np.dtype("float64"),
+        }
+        assert sampled.row_count(context) is None
+
+
+def test_preprocessing_chain_checks_custom_hidden_weight_when_sampling():
+    raw = event_source(variables=("id", "t"), filter_zeros=True, weight_key="p")
+    first = raw.preprocess(_no_payload, schema={"id": "int64", "w": "float64"})
+    second = first.preprocess(_no_payload, schema={"pixel": "int64", "w": "float64"})
+    sampled = second.sample(SamplingSettings(3, weight_key="w"))
+    assert sampled.required_variables == ("id", "t", "w", "p")
+    assert sampled.output_variables == ("pixel", "w")
+    assert len(sampled.preprocessors) == 2
+    with pytest.raises(ValueError, match="retain sampling weight 'p'"):
+        second.sample(SamplingSettings(3))
+    with pytest.raises(ValueError, match="retain sampling weight 'w'"):
+        raw.preprocess(_no_payload, schema={"id": "int64"}).preprocess(
+            _no_payload, schema={"id": "int64", "w": "float64"}
+        ).sample(SamplingSettings(3, weight_key="w"))
+    with pytest.raises(TypeError, match="weights must be real"):
+        raw.preprocess(_no_payload, schema={"p": "complex128"}).sample(
+            SamplingSettings(3)
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"callback": None, "schema": {"id": "int64"}},
+        {"callback": _no_payload, "schema": []},
+        {"callback": _no_payload, "schema": {}},
+        {"callback": _no_payload, "schema": {"bad name": "int64"}},
+        {"callback": _no_payload, "schema": {1: "int64"}},
+        {"callback": _no_payload, "schema": {"id": "S4"}},
+        {"callback": _no_payload, "schema": {"id": "int64"}, "description": 1},
+    ],
+)
+def test_preprocessing_specification_rejects_invalid_contracts(kwargs):
+    with pytest.raises((ValueError, TypeError)):
+        event_source().preprocess(**kwargs)
 
 
 @pytest.mark.parametrize(

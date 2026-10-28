@@ -3,7 +3,7 @@
 Use `mcstastox.create_template`, `create_empty_template`, `event_source`, and
 `write_nexus` for custom HDF5/NeXus layouts with just NumPy and h5py, without Scipp.
 The package also exports `NexusTemplate`, `SourceContext`, `EventSource`,
-`EventColumn`, and `WriteReport`.
+`EventTransform`, `EventColumn`, and `WriteReport`.
 
 For an executable introduction with a real McStas simulation, see
 [Write Sampled Events to a Custom NeXus File](custom_nexus_demo.ipynb). It uses
@@ -36,6 +36,19 @@ Construction is lazy; inspection uses read-only handles, not persistent h5py obj
 `create_empty_template()` needs no base file or temporary skeleton. Specify the layout
 and NeXus attributes explicitly, using the same editing/writing API. Add parents before
 children. Unbound zero-length datasets remain empty; whole bindings replace them.
+
+## Event Pipeline
+
+```text
+raw McStas row chunks -> optional raw zero filtering -> optional preprocessing
+                     -> existing sampler, if requested -> output batches
+                     -> multicolumn/column transforms -> destination projections
+```
+
+Preprocessing can derive columns and reject rows **before** selection. Output transforms
+preserve rows and run **after** optional sampling. Without sampling, prepared input chunks
+flow directly into output batching and transforms. These are lazy specifications:
+construction and template inspection do not execute callbacks or sample events.
 
 ## One Shared Sample
 
@@ -88,14 +101,104 @@ Separate objects execute independently even with equal settings; each write star
 
 Sampling reads hidden weights, preserves duplicates, and projects unit weights.
 There is no time/pixel sorting; `ordered=True` means input order. Without `.sample(...)`,
-rows stream unchanged. `filter_zeros=True` uses the source's `weight_key` even if not
-output. `component_name=None` selects components with pixel IDs in reader order.
+rows stream without selection unless filtering/preprocessing is requested.
+`filter_zeros=True` acts on raw rows **before preprocessing**, using the source's
+`weight_key` even if not output. Otherwise the sampler handles zero weights itself.
+`component_name=None` selects components with pixel IDs in reader order; select a
+logger without raw IDs explicitly.
 
 `id`/`t` alone do **not** establish complete `NXevent_data` pulse semantics: supply pulse
-origins, event indexes, time references, and other metadata. Effective duration is selected
-count / total input count rate, not inferred for arbitrary weights. Empty/no-positive samples
-have no duration: use `set_from_result(events, callback)` with an explicit fallback or the
-binding fails. Metadata validation cannot predict that case.
+origins, event indexes, time references, and other metadata. For count-rate weights,
+effective duration is selected count / total accepted count rate, not the raw intensity
+before preprocessing or a synthetic clock span. Arbitrary weights do not establish
+duration units or a physical exposure interpretation. Empty/no-positive samples have no
+duration: use `set_from_result(events, callback)` with an explicit fallback or the binding
+fails. Metadata validation cannot predict that case.
+
+## Preprocess Before Sampling
+
+`events.preprocess(callback, *, schema, description=None)` returns a new **unsampled**
+`EventSource`. Chain stages, write the prepared stream unsampled, or call
+`.sample(mx.SamplingSettings(...))` afterward. Calling `.preprocess(...)` on a sampled
+source is an error.
+
+For a MAGIC-style absorption-logger workflow, supply your own `voxelize(x, y, z)`
+helper: it returns one candidate integer pixel ID and a Boolean acceptance flag per row.
+McStasToX does not supply or validate that geometry. Here `logger_component` names the
+actual logger with raw variables `p`, `x`, `y`, `z`, `t` and **no raw `id`**. Assume `t`
+in seconds, count-rate weights `p`, and the event/duration destinations created above:
+
+```python
+def assign_detector_pixels(chunk):
+    pixel_ids, accepted = voxelize(chunk["x"], chunk["y"], chunk["z"])
+    return {
+        "p": chunk["p"][accepted],
+        "id": pixel_ids[accepted],
+        "t": chunk["t"][accepted],
+    }
+
+
+events = mx.event_source(
+    component_name=logger_component,
+    variables=("p", "x", "y", "z", "t"),
+).preprocess(
+    assign_detector_pixels,
+    schema={"p": "float64", "id": "int64", "t": "float64"},
+    description="Caller voxel acceptance and pixel assignment",
+).sample(mx.SamplingSettings(n_samples=100_000, seed=42))
+
+template["/entry/events/event_id"].copy_from(events["id"])
+template["/entry/events/event_time_offset"].copy_from(events["t"])
+template["/entry/events/event_time_offset"].attrs["units"] = "s"
+template["/entry/duration"].set_from_result(events, "effective_duration")
+template["/entry/duration"].attrs["units"] = "s"
+```
+
+The callback contract is deliberately narrow:
+
+- Each callback receives a full aligned dictionary of its stage's numeric columns,
+  including any hidden sampling weight. Arrays are private, read-only copies; do not
+  mutate them. The first stage receives raw read dependencies; later stages receive
+  the preceding stage's outputs.
+- Return a **complete dictionary** with exactly the declared `schema` keys. Nothing
+  passes through implicitly. Arrays must be one-dimensional, equally long, and have
+  at most the input row count. Deriving/replacing columns and rejecting rows are allowed;
+  duplication, expansion, aggregation, and reordering are not.
+- All returned columns must describe the same retained events in input order. Preserve
+  each retained event's original weight: no reweighting or renormalization to the raw
+  total. Accepted sampling weights must remain finite, real, and nonnegative.
+- Callbacks must be deterministic and batch-boundary independent, use chunk-bounded
+  memory plus caller lookup/model data, and not accumulate the stream or retain mutable
+  execution state across writes. Typed empty outputs and fully rejected streams are valid.
+
+Declared schemas are copied into immutable operation descriptors; editing the original
+schema dictionary does not change a stage. No first-batch probing is needed, even for
+empty streams. `events.variables` remains the requested **raw** names;
+`events.required_variables` also includes hidden raw dependencies.
+`events.raw_schema(context)` inspects those raw dependencies, while
+`events.schema(context)` exposes the final processed schema. `events.output_variables`
+lists projectable processed names (the original `variables` when there is no preprocessing).
+Thus derived `id` is checked against the processed schema, never requested from the raw
+table. Schema inspection reads metadata only; accepted row counts remain unknown until
+execution.
+
+`.sample(SamplingSettings(..., weight_key="w"))` validates **every** preprocessing stage:
+each schema must retain `w` with a real numeric dtype, even if only a later stage would
+otherwise introduce it. The chosen weight is also added as a hidden **raw** read dependency
+if absent from `variables`; it must exist in the source. The raw `filter_zeros` weight is
+independent and may be another column. Hidden dependencies are not implicitly projectable.
+
+The writer checks keys, dimensions, row counts, casts, and weight availability. It cannot
+prove event correspondence, original-weight identity, or callback determinism; those
+remain caller responsibilities. Integer IDs use checked casts, not truncation.
+
+For one shared source, preprocessing runs once per input chunk and the existing sampler
+consumes the prepared iterator once, not once per destination. Sample results use accepted
+weights: `total_weight = sum(p)` and `total_weight_variance = sum(p**2)` in this example.
+Effective duration and its variance use those accepted sums, not the raw population;
+rejected-stream statistics are not provided. Keep original simulation duration and
+synthetic clock spans separate. Empty/no-positive accepted streams still need the explicit
+duration fallback described above.
 
 ## Inspect and Clean
 
@@ -118,10 +221,12 @@ Retention warnings are advisory (default 100 MiB/dataset); `retained_warning_byt
 disables that threshold, not unknown-size reporting. First-release warnings are **diagnostics**
 in `validate()`, `summary()`, and `report.diagnostics`, not Python `warnings`. Errors block writing.
 
-`summary()` labels shared sources and shows ordered standard transforms, units, bindings,
-and retention with bounded output. Custom callbacks remain opaque: names and `description`
-labels are not verified mathematics. Neither method runs callbacks/sampling; their `source=`
-does not inspect schemas (writer preflight does). Unknown sizes/statistics stay unknown.
+`summary()` labels shared root sources and shows ordered preprocessing, raw dependencies,
+declared schemas, multicolumn/standard transforms, units, bindings, and retention with
+bounded output. Custom callbacks remain opaque: names and `description` labels are not
+verified mathematics or geometry. Neither validation nor summaries run callbacks/sampling;
+their `source=` does not inspect schemas (writer preflight does). Unknown sizes/statistics
+stay unknown.
 
 ## Source Access and Copies
 
@@ -167,14 +272,73 @@ setting a `units` attribute does not convert values.
 
 Single-column `.map(callback, dtype="float64", description="User time correction")` works.
 Callbacks receive a column array, preserve row count/order, and must be deterministic and
-batch-boundary independent. General multivariable custom chunk transforms are **not** in this delivery.
+batch-boundary independent.
+
+For multicolumn calculations, use
+`.transform(callback, *, inputs=(...), schema=..., description=None)` on an `EventSource`
+or another `EventTransform`. It returns an exported `EventTransform`, not a new sampling
+source. For example, this illustrative odd-pixel time correction is not an instrument
+calibration:
+
+```python
+def correct_times(chunk):
+    return {
+        "pixel": chunk["id"],
+        "time": chunk["t"] - 1e-6 * (chunk["id"] % 2),
+    }
+
+
+corrected = events.transform(
+    correct_times,
+    inputs=("id", "t"),
+    schema={"pixel": "int64", "time": "float64"},
+    description="Illustrative odd-pixel time correction",
+)
+template["/entry/events/event_id"].copy_from(corrected["pixel"])
+template["/entry/events/event_time_offset"].copy_from(
+    corrected["time"].convert_units("s", "us", dtype="float64")
+)
+template["/entry/events/event_time_offset"].attrs["units"] = "us"
+template.add_dataset("/entry/event_table", shape=(0, 2), dtype="float64").copy_from(
+    corrected, columns=("pixel", "time"), dtype="float64",
+)
+```
+
+Only declared `inputs` are passed, as an aligned dictionary of private, read-only arrays.
+Return the complete declared output dictionary, with one-dimensional numeric arrays that
+preserve **exactly** the input row count and order. Schemas are immutable snapshots; no
+columns pass through implicitly. Callbacks must be deterministic, batch-independent, and
+batch-local, including for empty inputs. Structural/cast checks cannot prove row semantics.
+
+Chain `.transform(...)` using the preceding transform's output names, or apply standard
+column operations to derived columns as above. `corrected.output_variables` is a separate
+output namespace; it does not add `pixel` or `time` to `events`. A table binding requires
+explicit unique `columns` in output order and one homogeneous dtype; separate arrays may
+have different dtypes. Here table `time` remains in seconds; units are still caller-supplied.
+
+All branches share `events.execution_source` and its one sample. Reuse the same transform
+object to cache its outputs once per output batch across dependent columns/tables; the
+cache is released between batches. Transforms run after optional sampling, cannot
+`.sample(...)` or `.preprocess(...)`, and are not a substitute for pre-sampling acceptance.
+No post-sampling filtering, expansion, or reweighting is allowed. A transform may omit the
+sampling weight; if returned under the chosen weight name, it must remain exactly `1`.
+Sampled-weight column operations must also preserve unit weights.
 
 The reader loads each row block's **full table width** before projection. Sampling retains
 **O(n_samples * variables)** values including hidden weights, plus copies/sort temporaries.
-Output transforms are batched, but smaller writes do not bound sampler memory. Mapping
-tables consume memory too. Replay sampling is **not implemented**. Seeds reproduce the
-sampler only for identical inputs, settings, component order, filtering, and fixed read partitioning.
-Read-batch changes may change samples/stats; write-batch changes do not change selection/alignment.
+Here `variables` means the prepared columns retained by the sampler. Preprocessing and
+output transforms do not improve sampler memory: smaller writes do not bound it. Mapping
+tables and caller geometry/model data consume memory too. Replay sampling is **not
+implemented**. Seeds reproduce the sampler only for identical inputs, settings, component
+order, filtering, preprocessing, and fixed sampler-input partitioning. Batch-independent
+preprocessing does not strengthen that promise: read-batch changes may change samples/stats;
+write-batch changes do not change the accepted stream, selection, statistics, or alignment.
+
+These hooks are not a broader prepared-event-product API. Detector routing, global sorting,
+pulse/index aggregation, histogram event generation, and multi-file pooling remain future
+adapter/provider work. They do not implement MAGIC post-sampling TOF thinning or Poisson
+mode. Facility-specific acceptance and production-size memory/performance benchmarks
+remain unverified.
 
 ## Links and Publication
 
@@ -201,9 +365,17 @@ write_nexus(template, output, *, source=None, entry_number=None,
 
 Validators receive the open, completed output `h5py.File` before publication; raise on failure.
 `progress(update)` gets `.phase`, `.path`, `.rows`; updates may be coarse, not percentages.
-`report.sources[events]` holds `n_written`, `n_selected`, `total_weight`, `total_weight_variance`,
-`effective_duration`, and `effective_duration_variance`. `report.destinations[path]` has
-`.shape`, `.dtype`, `.n_written`. Result callbacks receive source stats, not an open output.
+`report.sources[events]` is a scalar-only `SourceResult`: `n_written`, `n_selected`,
+`total_weight`, `total_weight_variance`, `effective_duration`, and
+`effective_duration_variance`. `report.preprocessing[events]` separately holds the ordered
+immutable tuple of preprocessing `ChunkOperation` descriptors, including callback, label,
+and immutable declared schema; it is not part of the scalar statistics record.
+`report.destinations[path]` has `.shape`, `.dtype`, `.n_written`, root `.source`, and
+`.transformations` descriptions. Its `.chunk_operations` is a structured, ordered tuple of
+output-transform descriptors with `.callback`, `.inputs`, `.schema`, and `.label`, separate
+from source preprocessing. Transformed destinations use the root `EventSource` as the
+report key, not a separate execution/statistics record. Result callbacks receive source
+stats, not an open output.
 
 Writing rejects input/output aliases, requires `overwrite=True` for existing output, and
 publishes atomically from a same-directory temporary file after result bindings/validators.

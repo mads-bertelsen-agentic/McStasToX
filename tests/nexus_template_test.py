@@ -624,6 +624,44 @@ def test_result_fields_are_names_not_expressions(no_payload_reads):
     assert "user description: Double duration" in template.summary()
 
 
+def test_preprocessing_summary_is_shared_bounded_and_metadata_only(
+    no_payload_reads, monkeypatch
+):
+    from mcstastox import EventSource, SamplingSettings, event_source
+
+    def assign_voxels(chunk):
+        pytest.fail("preprocessing must not execute during inspection")
+
+    monkeypatch.setattr(EventSource, "schema", assign_voxels)
+    monkeypatch.setattr(EventSource, "raw_schema", assign_voxels)
+    events = (
+        event_source(component_name="Logger", variables=("x", "y", "z", "t"))
+        .preprocess(
+            assign_voxels,
+            schema={"p": "float64", "id": "int64", "t": "float64"},
+            description="Detector acceptance",
+        )
+        .sample(SamplingSettings(7, seed=1))
+    )
+    template = create_empty_template()
+    template.add_dataset("/ids", shape=(0,), dtype="int64").copy_from(events["id"])
+    template.add_dataset("/times", shape=(0,), dtype="float64").copy_from(events["t"])
+    template.add_dataset("/duration", shape=(), dtype="float64").set_from_result(
+        events, "effective_duration"
+    )
+    template.validate(source=object()).raise_if_errors()
+    text = template.summary(source=object())
+    assert "sample1 -> id" in text
+    assert "sample1 -> t" in text
+    assert "sample2" not in text
+    assert "preprocessing 1: custom callback assign_voxels" in text
+    assert "user description: Detector acceptance" in text
+    assert "raw read dependencies" in text
+    assert "declared output schema: {p: float64, id: int64, t: float64}" in text
+    assert "accepted rows unknown" in text
+    assert len(text) < 3000
+
+
 @pytest.mark.parametrize(
     ("selection", "value"),
     [

@@ -13,7 +13,14 @@ del importlib
 
 from .LoadFile import Data as Read
 from .LoadFile import Transfer
-from .NexusSource import EventColumn, EventSource, SourceContext, event_source
+from .NexusSource import (
+    ChunkOperation,
+    EventColumn,
+    EventSource,
+    EventTransform,
+    SourceContext,
+    event_source,
+)
 from .NexusTemplate import (
     Diagnostic,
     NexusTemplate,

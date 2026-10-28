@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
+from itertools import islice
 from numbers import Number
 from os import PathLike
 from pathlib import Path
@@ -29,9 +30,11 @@ from .ReadNeXus import McStasNeXus, _validate_chunk_size
 from .Sampling import SamplingSettings
 
 __all__ = [
+    "ChunkOperation",
     "ColumnOperation",
     "EventColumn",
     "EventSource",
+    "EventTransform",
     "SourceContext",
     "event_source",
 ]
@@ -264,6 +267,95 @@ def _event_arrays(chunk: Mapping[str, Any]) -> dict[str, np.ndarray]:
     return arrays
 
 
+@dataclass(frozen=True, repr=False)
+class ChunkOperation:
+    """A custom dictionary callback with an immutable, complete output schema.
+
+    Schema inspection never executes the callback. Row correspondence, retained
+    weights, determinism, and batch independence remain caller responsibilities.
+    """
+
+    callback: Callable[[dict[str, np.ndarray]], Mapping[str, Any]]
+    schema: Mapping[str, DTypeLike]
+    inputs: tuple[str, ...] | None = None
+    label: str | None = None
+
+    def __post_init__(self) -> None:
+        if not callable(self.callback):
+            raise TypeError("callback must be callable")
+        if not isinstance(self.schema, Mapping):
+            raise TypeError(
+                "schema must be a mapping of variable names to numeric dtypes"
+            )
+        _names(tuple(self.schema), "schema variables")
+        object.__setattr__(
+            self,
+            "schema",
+            MappingProxyType(
+                {key: _numeric_dtype(value) for key, value in self.schema.items()}
+            ),
+        )
+        if self.inputs is not None:
+            object.__setattr__(self, "inputs", _names(self.inputs, "inputs"))
+        if self.label is not None and not isinstance(self.label, str):
+            raise TypeError("description must be a string or None")
+
+    def apply(
+        self,
+        chunk: Mapping[str, np.ndarray],
+        *,
+        allow_filter: bool = False,
+        context: str = "Chunk transform",
+    ) -> dict[str, np.ndarray]:
+        try:
+            names = tuple(chunk) if self.inputs is None else self.inputs
+            private = {}
+            for name in names:
+                private[name] = chunk[name].copy()
+                private[name].flags.writeable = False
+            result = self.callback(private)
+            if not isinstance(result, Mapping):
+                raise TypeError(
+                    "Chunk callback must return a dictionary matching its schema"
+                )
+            if set(result) != set(self.schema):
+                raise ValueError(
+                    "Chunk callback output keys must exactly match its schema"
+                )
+            arrays = _event_arrays(result)
+            count = len(next(iter(chunk.values())))
+            actual = len(next(iter(arrays.values())))
+            if (allow_filter and actual > count) or (
+                not allow_filter and actual != count
+            ):
+                rule = "not exceed" if allow_filter else "preserve"
+                raise ValueError(f"Chunk callback must {rule} the input row count")
+            return {
+                name: _checked_cast(arrays[name], dtype)
+                for name, dtype in self.schema.items()
+            }
+        except (ValueError, TypeError, KeyError, OverflowError, RuntimeError) as error:
+            raise type(error)(f"{context} ({self.description}): {error}") from error
+
+    @property
+    def description(self) -> str:
+        name = getattr(self.callback, "__name__", "")
+        text = "custom callback" + (
+            f" {name[:60]}" if name and name != "<lambda>" else ""
+        )
+        if self.label is not None:
+            text += f" (user description: {self.label[:100]})"
+        schema = ", ".join(
+            f"{key[:40]}: {dtype}" for key, dtype in islice(self.schema.items(), 5)
+        )
+        if len(self.schema) > 5:
+            schema += f", ... ({len(self.schema) - 5} more)"
+        return f"{text}; declared output schema={{{schema}}}"
+
+    def __repr__(self) -> str:
+        return f"ChunkOperation({self.description})"
+
+
 @dataclass(frozen=True, eq=False, repr=False)
 class EventSource:
     """An immutable, identity-based shared event execution specification.
@@ -279,6 +371,7 @@ class EventSource:
     filter_zeros: bool = False
     weight_key: str = "p"
     sampling: SamplingSettings | None = None
+    preprocessors: tuple[ChunkOperation, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", _names(self.variables, "variables"))
@@ -296,6 +389,18 @@ class EventSource:
             self.sampling, SamplingSettings
         ):
             raise TypeError("sampling must be a SamplingSettings instance")
+        object.__setattr__(self, "preprocessors", tuple(self.preprocessors))
+        for stage in self.preprocessors:
+            if not isinstance(stage, ChunkOperation) or stage.inputs is not None:
+                raise TypeError("preprocessors must be complete-schema ChunkOperations")
+            if self.sampling is not None:
+                weight = self.sampling.weight_key
+                if weight not in stage.schema:
+                    raise ValueError(
+                        f"Preprocessing schema must retain sampling weight {weight!r}"
+                    )
+                if stage.schema[weight].kind not in "iuf":
+                    raise TypeError("Preprocessed sampling weights must be real")
 
     @property
     def required_variables(self) -> tuple[str, ...]:
@@ -310,6 +415,53 @@ class EventSource:
         if not isinstance(settings, SamplingSettings):
             raise TypeError("settings must be a SamplingSettings instance")
         return replace(self, sampling=settings)
+
+    @property
+    def execution_source(self) -> EventSource:
+        return self
+
+    def transform(
+        self,
+        callback: Callable[[dict[str, np.ndarray]], Mapping[str, Any]],
+        *,
+        inputs: tuple[str, ...],
+        schema: Mapping[str, DTypeLike],
+        description: str | None = None,
+    ) -> EventTransform:
+        """Project row-preserving dictionary calculations after optional sampling."""
+        return EventTransform(
+            self, ChunkOperation(callback, schema, inputs, description)
+        )
+
+    def preprocess(
+        self,
+        callback: Callable[[dict[str, np.ndarray]], Mapping[str, Any]],
+        *,
+        schema: Mapping[str, DTypeLike],
+        description: str | None = None,
+    ) -> EventSource:
+        """Derive columns/reject rows before sampling, preserving retained weights.
+
+        The callback returns a complete aligned dictionary in retained input order.
+        It must be deterministic and batch independent; no row expansion is allowed.
+        Sampling-weight retention is checked when sampling settings are supplied.
+        """
+        if self.sampling is not None:
+            raise ValueError("preprocess must be called before sample")
+        stage = ChunkOperation(callback, schema, label=description)
+        return replace(self, preprocessors=(*self.preprocessors, stage))
+
+    @property
+    def output_variables(self) -> tuple[str, ...]:
+        """Projectable processed names; hidden raw weights are not implicit outputs."""
+        return (
+            tuple(self.preprocessors[-1].schema)
+            if self.preprocessors
+            else self.variables
+        )
+
+    def _processed_schema(self, raw: Mapping[str, np.dtype]) -> dict[str, np.dtype]:
+        return dict(self.preprocessors[-1].schema if self.preprocessors else raw)
 
     def _inspect(
         self, context: SourceContext
@@ -376,13 +528,17 @@ class EventSource:
         return reader, components, dict.fromkeys(self.required_variables, dtype), count
 
     def schema(self, context: SourceContext) -> dict[str, np.dtype]:
-        """Inspect all required columns using metadata only, including empty tables."""
+        """Inspect final schemas without executing callbacks or reading rows."""
+        return self._processed_schema(self.raw_schema(context))
+
+    def raw_schema(self, context: SourceContext) -> dict[str, np.dtype]:
+        """Inspect raw read dependencies, not derived preprocessing outputs."""
         return self._inspect(context)[2]
 
     def row_count(self, context: SourceContext) -> int | None:
         """Input rows before sampling; unknown when explicit filtering is enabled."""
         count = self._inspect(context)[3]
-        return None if self.filter_zeros else count
+        return None if self.filter_zeros or self.preprocessors else count
 
     def iter_chunks(self, context: SourceContext) -> Iterator[dict[str, np.ndarray]]:
         reader, components, schema, _ = self._inspect(context)
@@ -403,6 +559,10 @@ class EventSource:
                 if not np.any(nonzero):
                     continue
                 arrays = {key: values[nonzero] for key, values in arrays.items()}
+            for index, stage in enumerate(self.preprocessors, 1):
+                arrays = stage.apply(
+                    arrays, allow_filter=True, context=f"Preprocessing stage {index}"
+                )
             yield arrays
 
     def __getitem__(self, variable: str) -> EventColumn:
@@ -423,6 +583,10 @@ class EventSource:
         )
         if self.filter_zeros:
             result += f" (weight_key={self.weight_key!r})"
+        for index, stage in enumerate(self.preprocessors[:3], 1):
+            result += f"; preprocessing {index}: {stage.description}"
+        if len(self.preprocessors) > 3:
+            result += f"; ... ({len(self.preprocessors) - 3} more preprocessing stages)"
         if self.sampling is not None:
             settings = self.sampling
             result += (
@@ -600,6 +764,106 @@ class ColumnOperation:
         return f"ColumnOperation({self.description})"
 
 
+@dataclass(frozen=True, eq=False, repr=False)
+class EventTransform:
+    """A batch-local multi-column projection sharing its source's execution.
+
+    Complete output schemas and input names are declared without callback probes.
+    Callbacks preserve event order/count and are deterministic and batch independent.
+    Unlike preprocessing, these calculations run after any sampling operation.
+    """
+
+    source: EventSource | EventTransform
+    operation: ChunkOperation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, (EventSource, EventTransform)):
+            raise TypeError("source must be an event source or chunk transform")
+        if (
+            not isinstance(self.operation, ChunkOperation)
+            or self.operation.inputs is None
+        ):
+            raise TypeError("Chunk transforms require declared input variables")
+        for name in self.operation.inputs:
+            if name not in self.source.output_variables:
+                raise KeyError(
+                    f"Chunk transform input {name!r} is not declared by its source"
+                )
+        if self.sampling is not None:
+            dtype = self.operation.schema.get(self.sampling.weight_key)
+            if dtype is not None and dtype.kind not in "iuf":
+                raise TypeError("Transformed sampled weights must be real unit weights")
+
+    @property
+    def execution_source(self) -> EventSource:
+        return self.source.execution_source
+
+    @property
+    def sampling(self) -> SamplingSettings | None:
+        return self.execution_source.sampling
+
+    @property
+    def output_variables(self) -> tuple[str, ...]:
+        return tuple(self.operation.schema)
+
+    @property
+    def chunk_operations(self) -> tuple[ChunkOperation, ...]:
+        previous = (
+            self.source.chunk_operations
+            if isinstance(self.source, EventTransform)
+            else ()
+        )
+        return (*previous, self.operation)
+
+    def _processed_schema(self, raw: Mapping[str, np.dtype]) -> dict[str, np.dtype]:
+        return dict(self.operation.schema)
+
+    def transform(
+        self,
+        callback: Callable[[dict[str, np.ndarray]], Mapping[str, Any]],
+        *,
+        inputs: tuple[str, ...],
+        schema: Mapping[str, DTypeLike],
+        description: str | None = None,
+    ) -> EventTransform:
+        return EventTransform(
+            self, ChunkOperation(callback, schema, inputs, description)
+        )
+
+    def apply(
+        self,
+        chunk: Mapping[str, np.ndarray],
+        *,
+        cache: dict[EventTransform, dict[str, np.ndarray]] | None = None,
+    ) -> dict[str, np.ndarray]:
+        if cache is not None and self in cache:
+            return cache[self]
+        upstream = (
+            self.source.apply(chunk, cache=cache)
+            if isinstance(self.source, EventTransform)
+            else chunk
+        )
+        arrays = self.operation.apply(upstream)
+        if self.sampling is not None and self.sampling.weight_key in arrays:
+            if not np.all(arrays[self.sampling.weight_key] == 1):
+                raise ValueError(
+                    "Chunk transforms of sampled weights must preserve unit weights"
+                )
+        if cache is not None:
+            cache[self] = arrays
+        return arrays
+
+    def __getitem__(self, variable: str) -> EventColumn:
+        return EventColumn(self, variable)
+
+    @property
+    def description(self) -> str:
+        return f"chunk transform: {self.operation.description}"
+
+    def __repr__(self) -> str:
+        return f"EventTransform({self.description})"
+
+
 @dataclass(frozen=True, repr=False)
 class EventColumn:
     """One declared source variable and an ordered, row-preserving pipeline.
@@ -609,14 +873,14 @@ class EventColumn:
     batch-boundary independent; only dimensionality and row count can be checked.
     """
 
-    source: EventSource
+    source: EventSource | EventTransform
     variable: str
     operations: tuple[ColumnOperation, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, EventSource):
-            raise TypeError("source must be an EventSource")
-        if self.variable not in self.source.variables:
+        if not isinstance(self.source, (EventSource, EventTransform)):
+            raise TypeError("source must be an EventSource or EventTransform")
+        if self.variable not in self.source.output_variables:
             raise KeyError(
                 f"Variable {self.variable!r} is not declared by this EventSource"
             )
@@ -728,7 +992,26 @@ class EventColumn:
             dtype = operation.output_dtype(dtype)
         return dtype
 
-    def apply(self, chunk_dict: Mapping[str, Any]) -> np.ndarray:
+    @property
+    def execution_source(self) -> EventSource:
+        return self.source.execution_source
+
+    @property
+    def chunk_operations(self) -> tuple[ChunkOperation, ...]:
+        return (
+            self.source.chunk_operations
+            if isinstance(self.source, EventTransform)
+            else ()
+        )
+
+    def apply(
+        self,
+        chunk_dict: Mapping[str, Any],
+        *,
+        cache: dict[EventTransform, dict[str, np.ndarray]] | None = None,
+    ) -> np.ndarray:
+        if isinstance(self.source, EventTransform):
+            chunk_dict = self.source.apply(chunk_dict, cache=cache)
         arrays = _event_arrays(chunk_dict)
         values = arrays[self.variable]
         _numeric_dtype(values.dtype)
